@@ -1,7 +1,10 @@
 import copy
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from sympy import prime
+
 import buffer
 
 from dataclasses import dataclass
@@ -24,24 +27,14 @@ class Hyperparameters:
     LOG_SIG_MAX: float = 2
     LOG_SIG_MIN: float = -20
     ACTION_BOUND_EPSILON: float = 1E-6
+    alpha_sac: float = .01
 
-    # LAP
-    alpha: float = 0.4
-    min_priority: float = 1
+    # RRS
+    alpha_max: float = 1
+    alpha_min: float = .5
 
     # TD3+BC
     lmbda: float = 0.1
-
-    # Checkpointing
-    max_eps_when_checkpointing: int = 20
-    steps_before_checkpointing: int = 75e4
-    reset_weight: float = 0.9
-
-    # Encoder Model
-    zs_dim: int = 256
-    enc_hdim: int = 256
-    enc_activ: Callable = F.elu
-    encoder_lr: float = 3e-4
 
     # Critic Model
     critic_hdim: int = 256
@@ -63,17 +56,16 @@ def LAP_huber(x, min_priority=1):
     return torch.where(x < min_priority, 0.5 * x.pow(2), min_priority * x).sum(1).mean()
 
 
-
 # Actor.
 class Actor(nn.Module):
-    def __init__(self, state_dim, action_dim, args, LOG_SIG_MIN, LOG_SIG_MAX, ACTION_BOUND_EPSILON, zs_dim=256, hdim=256, activ=F.relu):
+    def __init__(self, state_dim, action_dim, args, LOG_SIG_MIN, LOG_SIG_MAX, ACTION_BOUND_EPSILON, hdim=256, activ=F.relu):
         super(Actor, self).__init__()
 
         self.activ = activ
 
         # Noisy linear.
         self.l0 = nn.Linear(state_dim, hdim)
-        self.l1 = nn.Linear(zs_dim + hdim, hdim)
+        self.l1 = nn.Linear(hdim, hdim)
         self.l2 = nn.Linear(hdim, hdim)
         self.l3 = nn.Linear(hdim, action_dim)
 
@@ -86,12 +78,9 @@ class Actor(nn.Module):
 
         self.args = args
 
-    def forward(self, state, zs, deterministic=False, return_log_prob=True):
+    def forward(self, state, deterministic=False, return_log_prob=True):
         # Normalization.
         a = AvgL1Norm(self.l0(state))
-
-        # Embedding.
-        a = torch.cat([a, zs], 1)
 
         # Fully connected.
         a = self.activ(self.l1(a))
@@ -121,72 +110,29 @@ class Actor(nn.Module):
 
         return action, log_prob
 
-
-# Encoder.
-class Encoder(nn.Module):
-    def __init__(self, state_dim, action_dim, args, zs_dim=256, hdim=256, activ=F.elu):
-        super(Encoder, self).__init__()
-
-        self.activ = activ
-
-        # state encoder
-        self.zs1 = nn.Linear(state_dim, hdim)
-        self.zs2 = nn.Linear(hdim, hdim)
-        self.zs3 = nn.Linear(hdim, zs_dim)
-
-        # state-action encoder
-        self.zsa1 = nn.Linear(zs_dim + action_dim, hdim)
-        self.zsa2 = nn.Linear(hdim, hdim)
-        self.zsa3 = nn.Linear(hdim, zs_dim)
-
-        self.args = args
-
-    def zs(self, state):
-        # Fully connected.
-        zs = self.activ(self.zs1(state))
-        zs = self.activ(self.zs2(zs))
-
-        # Normalization.
-        zs = AvgL1Norm(self.zs3(zs))
-
-        return zs
-
-    def zsa(self, zs, action):
-        # Fully connected.
-        zsa = self.activ(self.zsa1(torch.cat([zs, action], 1)))
-        zsa = self.activ(self.zsa2(zsa))
-        zsa = self.zsa3(zsa)
-
-        return zsa
-
 # TD3 Critic.
 class TD3Critic(nn.Module):
-    def __init__(self, state_dim, action_dim, args, zs_dim=256, hdim=256, activ=F.elu):
+    def __init__(self, state_dim, action_dim, args, hdim=256, activ=F.elu):
         super(TD3Critic, self).__init__()
 
         self.activ = activ
 
         # Fully connected.
         self.q0 = nn.ParameterList([nn.Linear(state_dim + action_dim, hdim) for _ in range(args.N)])
-        self.q1 = nn.ParameterList([nn.Linear(2 * zs_dim + hdim, hdim) for _ in range(args.N)])
+        self.q1 = nn.ParameterList([nn.Linear(hdim, hdim) for _ in range(args.N)])
         self.q2 = nn.ParameterList([nn.Linear(hdim, hdim) for _ in range(args.N)])
         self.q3 = nn.ParameterList([nn.Linear(hdim, 1) for _ in range(args.N)])
 
         self.args = args
 
-    def forward(self, state, action, zsa, zs):
+    def forward(self, state, action):
         sa = torch.cat([state, action], 1)
-        embeddings = torch.cat([zsa, zs], 1)
-
         q_values = []
 
         # Ensemble.
         for i in range(self.args.N):
             # Normalization.
             q = AvgL1Norm(self.q0[i](sa))
-
-            # Embedding.
-            q = torch.cat([q, embeddings], 1)
 
             # Fully connected.
             q = self.activ(self.q1[i](q))
@@ -214,13 +160,14 @@ class Agent(object):
 
         self.init()
 
+    def scaled_sigmoid(self, x):
+        return self.hp.alpha_min + (self.hp.alpha_max - self.hp.alpha_min) / (1 + np.exp(-x))
+
     def init(self):
-        self.actor = Actor(self.state_dim, self.action_dim, self.args, self.hp.LOG_SIG_MIN, self.hp.LOG_SIG_MAX, self.hp.ACTION_BOUND_EPSILON, self.hp.zs_dim,
+        self.actor = Actor(self.state_dim, self.action_dim, self.args, self.hp.LOG_SIG_MIN, self.hp.LOG_SIG_MAX, self.hp.ACTION_BOUND_EPSILON,
                            self.hp.actor_hdim, self.hp.actor_activ).to(self.device)
-        self.critic = TD3Critic(self.state_dim, self.action_dim, self.args, self.hp.zs_dim, self.hp.critic_hdim,
+        self.critic = TD3Critic(self.state_dim, self.action_dim, self.args, self.hp.critic_hdim,
                                 self.hp.critic_activ).to(self.device)
-        self.encoder = Encoder(self.state_dim, self.action_dim, self.args, self.hp.zs_dim, self.hp.enc_hdim,
-                               self.hp.enc_activ).to(self.device)
 
         self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=self.hp.actor_lr)
         self.actor_target = copy.deepcopy(self.actor)
@@ -229,39 +176,17 @@ class Agent(object):
         self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=self.hp.critic_lr)
         self.critic_target = copy.deepcopy(self.critic)
 
-        self.encoder_optimizer = torch.optim.Adam(self.encoder.parameters(), lr=self.hp.encoder_lr)
-        self.fixed_encoder = copy.deepcopy(self.encoder)
-        self.fixed_encoder_target = copy.deepcopy(self.encoder)
-        self.checkpoint_encoder = copy.deepcopy(self.encoder)
-
         # Experience Replay
         self.replay_buffer = buffer.LAP(self.state_dim, self.action_dim, self.device, self.args, self.args.buffer_size, self.hp.batch_size, self.max_action,
-                                        normalize_actions=True, prioritized="TD7" in self.args.policy)
+                                        normalize_actions=True)
 
-        if "CQL" in self.args.policy or "MCQ" in self.args.policy:
+        if "CQL" in self.args.policy:
             self.cql_alpha = torch.tensor(1.0, requires_grad=True, device=self.device)
             self.cql_alpha_optimizer = torch.optim.Adam([self.cql_alpha], lr=1e-4)
 
         self.training_steps = 0
-
-        # Checkpointing tracked values
-        self.eps_since_update = 0
-        self.timesteps_since_update = 0
-        self.max_eps_before_update = 1
-        self.min_return = 1e8
-        self.best_min_return = -1e8
-
-        # Value clipping tracked values
-        self.max = -1e8
-        self.min = 1e8
-        self.max_target = 0
-        self.min_target = 0
-
-        # EE value.
-        self.ee_value = 0
-        self.cql_value = 0
-        self.oe_value = 0
-        self.ent_value = 0
+        self.rewards_std = 0
+        self.std_inverse_sum = 0
 
     def compute_cql_loss(self, state, action, zsa, zs):
         with torch.no_grad():
@@ -278,16 +203,10 @@ class Agent(object):
 
         return cql_loss
 
-    def select_action(self, state, use_checkpoint=False, use_exploration=True, deterministic=True):
+    def select_action(self, state, use_exploration=True, deterministic=True):
         with torch.no_grad():
             state = torch.tensor(state.reshape(1, -1), dtype=torch.float, device=self.device)
-
-            zs = self.fixed_encoder.zs(state)
-            action, _ = self.actor(state, zs, deterministic=deterministic)
-
-            if use_checkpoint and "TD7" in self.args.policy:
-                zs = self.checkpoint_encoder.zs(state)
-                action, _ = self.checkpoint_actor(state, zs, deterministic=deterministic)
+            action, _ = self.actor(state, deterministic=deterministic)
 
             if use_exploration:
                 noise = torch.randn_like(action) * (0 if "SAC" in self.args.policy else self.args.exploration_noise)
@@ -297,70 +216,23 @@ class Agent(object):
 
     def train(self):
         self.training_steps += 1
-        state, action, next_state, reward, not_done = self.replay_buffer.sample(prioritized="TD7" in self.args.policy)
-
-        # Update Encoder.
-        if "TD7" in self.args.policy or "SALE" in self.args.policy:
-            with torch.no_grad():
-                next_zs = self.encoder.zs(next_state)
-
-            zs = self.encoder.zs(state)
-            pred_zs = self.encoder.zsa(zs, action)
-
-            # Loss.
-            encoder_loss = F.mse_loss(pred_zs, next_zs)
-            self.encoder_optimizer.zero_grad()
-            encoder_loss.backward()
-            self.encoder_optimizer.step()
+        state, action, next_state, reward, not_done = self.replay_buffer.sample()
 
         # Update Critic.
         with torch.no_grad():
             # State next.
-            fixed_target_zs = self.fixed_encoder_target.zs(next_state)
-            next_action, next_action_log_prob = self.actor_target(next_state, fixed_target_zs, deterministic=False if "SAC" in self.args.policy else True)
+            next_action, next_action_log_prob = self.actor_target(next_state, deterministic=False if "SAC" in self.args.policy else True)
 
-            # Noise.
             noise = (torch.randn_like(action) * (0 if "SAC" in self.args.policy else self.hp.target_policy_noise)).clamp(-self.hp.noise_clip, self.hp.noise_clip)
-
-            # Action
             next_action = (next_action + noise).clamp(-1, 1)
 
-            # Embedding
-            fixed_target_zsa = self.fixed_encoder_target.zsa(fixed_target_zs, next_action)
-            fixed_zs = self.fixed_encoder.zs(state)
-            fixed_zsa = self.fixed_encoder.zsa(fixed_zs, action)
-
             # Q-values
-            Q_next = self.critic_target(next_state, next_action, fixed_target_zsa, fixed_target_zs)
-
-            # EE value.
-            ee_value = Q_next.std(1, keepdim=True).mean().item()
-
-            # TD3
+            Q_next = self.critic_target(next_state, next_action)
             Q_target_next = Q_next.min(1, keepdim=True)[0]
-
-            # EE values.
-            self.ee_value += ee_value / Q_next.mean(1, keepdim=True).mean().item()
-
-            if "TD7" in self.args.policy:
-                # TD7
-                Q_target_next = Q_target_next.clamp(self.min_target, self.max_target)
-
-            # SAC
             entropy_bonus =  next_action_log_prob if "SAC" in self.args.policy else 0
 
-            self.ent_value += next_action_log_prob.mean().item()
-
             with torch.no_grad():
-                actor, _ = self.actor(state, fixed_zs)
-
-            # SRS.
-            if "SN" in self.args.policy:
-                # Q-targets.
-                rewards_mean, rewards_max = self.replay_buffer.reward[:self.replay_buffer.size].mean(), self.replay_buffer.reward[:self.replay_buffer.size].max()
-                reward = reward.expand((self.replay_buffer.batch_size, self.args.N)).clone()
-
-                reward = (1 / self.args.alpha_srs) * (1 + (self.args.alpha_srs * ((reward - rewards_mean) / rewards_max)).exp()).log()
+                actor, _ = self.actor(state)
 
             if "RRS" in self.args.policy:
                 # Q-targets.
@@ -368,25 +240,35 @@ class Agent(object):
                 reward = reward.expand((self.replay_buffer.batch_size, self.args.N)).clone()
                 reward_norm = ((reward - rewards_mean) / rewards_max)
 
-                reward = (1 / self.args.alpha_rrs) * 1 / (1 + (-self.args.alpha_rrs * reward_norm).exp()) * (1 + (self.args.alpha_rrs * reward_norm).exp()).log()
+                reward = (1 / self.args.alpha) * 1 / (1 + (-self.args.alpha * reward_norm).exp()) * (1 + (self.args.alpha * reward_norm).exp()).log()
 
-            Q_target_next = Q_target_next - self.args.alpha_sac * entropy_bonus - (self.args.alpha_ee * ee_value if "SQT" in self.args.policy else 0)
+                if self.args.auto_alpha == 1:
+                    rewards_std = self.replay_buffer.reward.std()
+                    std_inverse = 1 / rewards_std
+
+                    self.std_inverse_sum += std_inverse
+
+                    if (self.training_steps + self.args.timesteps_before_training) % self.args.auto_alpha_interval == 0:
+                        std_inverse_mean = self.std_inverse_sum / self.args.auto_alpha_interval
+                        self.args.alpha = self.scaled_sigmoid(std_inverse_mean)
+
+                        self.std_inverse_sum = 0
+
+            rewards_std = self.replay_buffer.reward.std()
+            self.rewards_std += rewards_std
+
+            Q_target_next = Q_target_next - self.hp.alpha_sac * entropy_bonus
             Q_target = reward + not_done * self.args.discount * Q_target_next
 
-            if "TD7" in self.args.policy:
-                self.max, self.min = max(self.max, float(Q_target.max())), min(self.min, float(Q_target.min()))
-
         # TD loss.
-        Q = self.critic(state, action, fixed_zsa, fixed_zs)
+        Q = self.critic(state, action)
         td_loss = (Q - Q_target).abs()
 
         if "CQL" in self.args.policy:
-            cql_loss = self.compute_cql_loss(state, action, fixed_zsa, fixed_zs)
+            cql_loss = self.compute_cql_loss(state, action)
 
             critic_loss = .5 * td_loss + self.args.alpha_cql * cql_loss
             critic_loss = LAP_huber(critic_loss)
-
-            self.cql_value += cql_loss.item()
 
             self.critic_optimizer.zero_grad()
             critic_loss.backward()
@@ -400,21 +282,14 @@ class Agent(object):
             critic_loss.backward(retain_graph=True)
             self.critic_optimizer.step()
 
-        # Update LAP.
-        if "TD7" in self.args.policy:
-            priority = td_loss.max(1)[0]
-            priority = priority.clamp(min=self.hp.min_priority).pow(self.hp.alpha)
-            self.replay_buffer.update_priority(priority)
-
         # Update Actor.
         if self.training_steps % self.hp.policy_freq == 0:
-            actor, log_prob_a_tilda = self.actor(state, fixed_zs)
-            fixed_zsa = self.fixed_encoder.zsa(fixed_zs, actor)
-            Q = self.critic(state, actor, fixed_zsa, fixed_zs)
+            actor, log_prob_a_tilda = self.actor(state)
+            Q = self.critic(state, actor)
             actor_loss = -Q.mean()
 
             # BC
-            if self.args.offline == 1 and ("BC" in self.args.policy or "TD7" in self.args.policy):
+            if self.args.offline == 1 and "BC" in self.args.policy:
                 BC_loss = F.mse_loss(actor, action)
                 actor_loss += self.hp.lmbda * Q.abs().mean().detach() * BC_loss
 
@@ -426,45 +301,3 @@ class Agent(object):
         if self.training_steps % self.hp.target_update_rate == 0:
             self.actor_target.load_state_dict(self.actor.state_dict())
             self.critic_target.load_state_dict(self.critic.state_dict())
-
-            if "TD7" in self.args.policy:
-                self.fixed_encoder_target.load_state_dict(self.fixed_encoder.state_dict())
-                self.fixed_encoder.load_state_dict(self.encoder.state_dict())
-
-                self.replay_buffer.reset_max_priority()
-
-                self.max_target = self.max
-                self.min_target = self.min
-
-    # If using checkpoints: run when each episode terminates
-    def maybe_train_and_checkpoint(self, ep_timesteps, ep_return):
-        self.eps_since_update += 1
-        self.timesteps_since_update += ep_timesteps
-        self.min_return = min(self.min_return, ep_return)
-
-        # End evaluation of current policy early
-        if self.min_return < self.best_min_return:
-            self.train_and_reset()
-
-        # Update checkpoint
-        elif self.eps_since_update == self.max_eps_before_update:
-            self.best_min_return = self.min_return
-
-            self.checkpoint_actor.load_state_dict(self.actor.state_dict())
-            self.checkpoint_encoder.load_state_dict(self.fixed_encoder.state_dict())
-
-            self.train_and_reset()
-
-    # Batch training
-    def train_and_reset(self):
-        # UTD
-        for _ in range(self.timesteps_since_update):
-            if self.training_steps == self.hp.steps_before_checkpointing:
-                self.best_min_return *= self.hp.reset_weight
-                self.max_eps_before_update = self.hp.max_eps_when_checkpointing
-
-            self.train()
-
-        self.eps_since_update = 0
-        self.timesteps_since_update = 0
-        self.min_return = 1e8
