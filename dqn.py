@@ -153,7 +153,6 @@ class Agent():
         self.optimizer = optim.AdamW(self.policy_net.parameters(), lr=args.lr, amsgrad=True)
 
         self.memory = ReplayMemory(args.replay_size, args)
-        self.unconscious_memory = ReplayMemory(args.replay_size, args)
 
         self.std_inverse_sum = 0
 
