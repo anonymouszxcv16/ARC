@@ -10,6 +10,7 @@ import buffer
 from dataclasses import dataclass
 from typing import Callable
 from torch.distributions import Normal
+from torch.distributions.beta import Beta
 
 @dataclass
 class Hyperparameters:
@@ -32,6 +33,9 @@ class Hyperparameters:
     # RRS
     alpha_max: float = 1
     alpha_min: float = .5
+
+    # SASR
+    reward_weight: float = 0.6
 
     # TD3+BC
     lmbda: float = 0.1
@@ -188,20 +192,45 @@ class Agent(object):
         self.rewards_std = 0
         self.std_inverse_sum = 0
 
-    def compute_cql_loss(self, state, action, zsa, zs):
+    def compute_cql_loss(self, state, action):
         with torch.no_grad():
             # Actor
-            actor, _ = self.actor_target(state, zs, deterministic=False)
-            q_values = self.critic_target(state, actor, zsa, zs).mean(1, keepdim=True)
+            actor, _ = self.actor_target(state, deterministic=False)
+            q_values = self.critic_target(state, actor).mean(1, keepdim=True)
 
             # Current Q-values (for data actions)
-            y = self.critic_target(state, action, zsa, zs).mean(1, keepdim=True)
+            y = self.critic_target(state, action).mean(1, keepdim=True)
 
         # Q values actor log sum exp.
         penalty_target = torch.logsumexp(q_values, dim=1, keepdim=True)
         cql_loss = (penalty_target - y).mean()
 
         return cql_loss
+
+    def state_key(self, s):
+        """Convert torch/numpy state to hashable tuple."""
+        if isinstance(s, torch.Tensor):
+            s = s.cpu().numpy()
+
+        return tuple(s.round(2).flatten())
+
+    def compute_SASR_shaped_reward(self, states, rewards, prior=1.0):
+        """SASR: State-wise Adaptive Success-rate shaped reward."""
+        shaped_r = torch.zeros(rewards.shape)
+
+        # For continuous states: use state hashing or discretization
+        for i in range(states.shape[0]):
+
+            s = states[i, :]
+
+            alpha = self.replay_buffer.success_count[self.state_key(s)] + prior
+            beta = self.replay_buffer.failure_count[self.state_key(s)] + prior
+
+            f = Beta(alpha, beta).sample()  # sampled success-rate
+
+            shaped_r[i, :] = rewards[i, :] * f
+
+        return shaped_r.to(rewards.device)
 
     def select_action(self, state, use_exploration=True, deterministic=True):
         with torch.no_grad():
@@ -234,25 +263,33 @@ class Agent(object):
             with torch.no_grad():
                 actor, _ = self.actor(state)
 
-            if "RRS" in self.args.policy:
+            if "SASR" in self.args.policy:
+                shaped_rewards = self.compute_SASR_shaped_reward(state, reward)
+                reward = reward + self.hp.reward_weight * shaped_rewards
+
+            if "RRS" in self.args.policy or "NRS" in self.args.policy:
                 # Q-targets.
                 rewards_mean, rewards_max = self.replay_buffer.reward[:self.replay_buffer.size].mean(), self.replay_buffer.reward[:self.replay_buffer.size].max()
                 reward = reward.expand((self.replay_buffer.batch_size, self.args.N)).clone()
-                reward_norm = ((reward - rewards_mean) / rewards_max)
+                reward = ((reward - rewards_mean) / rewards_max)
 
-                reward = (1 / self.args.alpha) * 1 / (1 + (-self.args.alpha * reward_norm).exp()) * (1 + (self.args.alpha * reward_norm).exp()).log()
+                if "TANH" in self.args.policy:
+                    reward = torch.tanh(reward)
 
-                if self.args.auto_alpha == 1:
-                    rewards_std = self.replay_buffer.reward.std()
-                    std_inverse = 1 / rewards_std
+                if "RRS" in self.args.policy:
+                    reward = (1 / self.args.alpha) * 1 / (1 + (-self.args.alpha * reward).exp()) * (1 + (self.args.alpha * reward).exp()).log()
 
-                    self.std_inverse_sum += std_inverse
+                    if self.args.auto_alpha == 1:
+                        rewards_std = self.replay_buffer.reward.std()
+                        std_inverse = 1 / rewards_std
 
-                    if (self.training_steps + self.args.timesteps_before_training) % self.args.auto_alpha_interval == 0:
-                        std_inverse_mean = self.std_inverse_sum / self.args.auto_alpha_interval
-                        self.args.alpha = self.scaled_sigmoid(std_inverse_mean)
+                        self.std_inverse_sum += std_inverse
 
-                        self.std_inverse_sum = 0
+                        if (self.training_steps + self.args.timesteps_before_training) % self.args.auto_alpha_interval == 0:
+                            std_inverse_mean = self.std_inverse_sum / self.args.auto_alpha_interval
+                            self.args.alpha = self.scaled_sigmoid(std_inverse_mean)
+
+                            self.std_inverse_sum = 0
 
             rewards_std = self.replay_buffer.reward.std()
             self.rewards_std += rewards_std

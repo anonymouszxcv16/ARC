@@ -85,11 +85,33 @@ class LAP(object):
 
 	# Load offline dataset.
 	def load_D4RL(self, dataset):
-		self.state = dataset['observations']
-		self.action = dataset['actions']
-		self.next_state = dataset['next_observations']
-		self.reward = dataset['rewards'].reshape(-1, 1)
-		self.not_done = 1. - dataset['terminals'].reshape(-1, 1)
+		"""Load Minari dataset and convert to D4RL format."""
+
+		# Convert to D4RL-style flat arrays - use lists
+		states, actions, next_states, rewards, not_dones = [], [], [], [], []
+
+		# Iterate over episodes
+		for episode in dataset.iterate_episodes():  # or just 'for episode in dataset'
+			observations = episode.observations  # numpy array (T+1, obs_dim)
+			actions_arr = episode.actions  # numpy array (T, act_dim)
+			rewards_arr = episode.rewards  # numpy array (T,)
+			terminations = episode.terminations  # numpy array (T,)
+			truncations = getattr(episode, 'truncations', np.zeros_like(episode.rewards))
+
+			# Align observations with actions/rewards
+			T = len(actions_arr)
+			states.extend(observations[:-1])  # First T observations
+			actions.extend(actions_arr)
+			next_states.extend(observations[1:])  # Next T observations
+			rewards.extend(rewards_arr)
+			not_dones.extend(1.0 - (terminations | truncations))
+
+		# Convert to tensors
+		self.state = torch.tensor(np.array(states), dtype=torch.float32)
+		self.action = torch.tensor(np.array(actions), dtype=torch.float32)
+		self.next_state = torch.tensor(np.array(next_states), dtype=torch.float32)
+		self.reward = torch.tensor(np.array(rewards), dtype=torch.float32).reshape(-1, 1)
+		self.not_done = torch.tensor(np.array(not_dones), dtype=torch.float32).reshape(-1, 1)
 		self.size = self.state.shape[0]
 
 		if self.prioritized:
