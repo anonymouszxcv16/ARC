@@ -54,18 +54,37 @@ def train_online(RL_agent, env, eval_env, args):
 
     episode_transitions = []
 
+    trunc = False
+
+    state = torch.tensor(state[0]['observation'])
+
+    t0 = 0
+
     # Train loop.
     for t in range(int(args.max_timesteps + 1)):
+        RL_agent.t += 1
         maybe_evaluate_and_print(RL_agent, eval_env, evals, times, alphas, stds, mus, Ms, t, start_time, args)
 
         # Select action.
         if allow_train:
-            action = RL_agent.select_action(np.array(state), deterministic=False if "SAC" in args.policy else True)
+            action, log_policy = RL_agent.select_action(np.array(state), deterministic=False if "SAC" in args.policy else True)
+
         else:
-            action = env.action_space.sample()
+            # old: action = env.action_space.sample()
+
+            low = torch.tensor(env.action_space.low)
+            high = torch.tensor(env.action_space.high)
+            dist = torch.distributions.Uniform(low, high)
+            action = dist.sample()
+            # old: log_prob = dist.log_prob(action).sum()  # sum over action dims
+            log_policy = dist.log_prob(action).sum()  # sum over action dims
+
 
         # Do a step.
-        next_state, reward, ep_finished, _ = env.step(action)
+        # old: next_state, reward, ep_finished, _ = env.step(action)
+        next_state, reward, ep_finished, trunc, _ = eval_env.step(action)
+
+        next_state = torch.tensor(next_state['observation'])
 
         if "Noise" in args.policy:
             sign = 1 if random.randint(0, 1) == 1 else -1
@@ -80,7 +99,7 @@ def train_online(RL_agent, env, eval_env, args):
         done = float(ep_finished or ep_timesteps == env._max_episode_steps)
 
         # Store tuple.
-        RL_agent.replay_buffer.add(state, action, next_state, reward, done)
+        RL_agent.replay_buffer.add(state, action, next_state, reward, done, log_policy)
 
         state = next_state
 
@@ -106,7 +125,30 @@ def train_online(RL_agent, env, eval_env, args):
             ep_total_reward, ep_timesteps = 0, 0
             ep_num += 1
 
+            trunc = False
+
+            state = torch.tensor(state[0]['observation'])
+
             episode_transitions = []
+
+            # Episode length
+            T = RL_agent.t - t0
+            scores = torch.zeros((T, 1)).to(args.device)
+
+            # Gt
+            for step in range(T):
+                # t
+                for t in range(step, T):
+                    # r_t
+                    r_t = RL_agent.replay_buffer.reward[RL_agent.t - t0 + t]
+
+                    r_t = torch.tensor(r_t).to(args.device)
+
+                    # r_t ** discount
+                    scores[step] += r_t * args.discount ** (t - step)
+
+            RL_agent.replay_buffer.mc_score[t0:RL_agent.t] = scores
+            t0 = RL_agent.t
 
 
 # Logs.
@@ -120,13 +162,19 @@ def maybe_evaluate_and_print(RL_agent, eval_env, evals, times, alphas, stds, mus
             state, done = eval_env.reset()[0], False
             step = 0
 
+            state = torch.tensor(state['observation'])
+
             # Episode
             while not done:
                 # Action selection.
-                action = RL_agent.select_action(state, use_exploration=False)
+                # old: action = RL_agent.select_action(state, use_exploration=False)
+                action, _ = RL_agent.select_action(state, use_exploration=False)
 
                 # Step.
                 state, reward, done, trunc, _ = eval_env.step(action)
+                # print(state)
+
+                state = torch.tensor(state['observation'])
 
                 # Reward sum.
                 total_reward[ep] += reward
@@ -167,13 +215,15 @@ if __name__ == "__main__":
     parser.add_argument("--policy", default="TD3", type=str)
     parser.add_argument("--alpha_cql", default=5, type=float)
     parser.add_argument("--noise_frac_max", default=.01, type=float)
-    parser.add_argument("--alpha", default=1, type=float)
+    parser.add_argument("--alpha", default=0.5, type=float)
     parser.add_argument("--auto_alpha", default=0, type=int)
     parser.add_argument("--auto_alpha_interval", default=100_000, type=int)
     parser.add_argument('--offline', default=0, type=int)
 
+    parser.add_argument("--eps", default=0.2, type=float)
+
     # Exploration.
-    parser.add_argument("--timesteps_before_training", default=25_000, type=int)
+    parser.add_argument("--timesteps_before_training", default=0, type=int)
     parser.add_argument("--exploration_noise", default=.1, type=float)
     parser.add_argument("--discount", default=.99, type=float)
     parser.add_argument("--N", default=2, type=int)
@@ -210,6 +260,12 @@ if __name__ == "__main__":
         args.use_checkpoints = False
 
     else:
+        import gymnasium as gym
+        import gymnasium_robotics
+
+        # Register the robotics environments into the gym registry
+        # old: gymnasium_robotics.register_envs()
+
         # environment
         env = gym.make(args.env)
         eval_env = gym.make(args.env)
@@ -221,7 +277,8 @@ if __name__ == "__main__":
     np.random.seed(args.seed)
 
     # Environment
-    state_dim = env.observation_space.shape[0]
+    # old: state_dim = env.observation_space.shape[0]
+    state_dim = env.observation_space['observation'].shape[0]
     action_dim = env.action_space.shape[0]
     max_action = float(env.action_space.high[0])
 

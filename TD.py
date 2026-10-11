@@ -192,6 +192,8 @@ class Agent(object):
         self.rewards_std = 0
         self.std_inverse_sum = 0
 
+        self.t = 0
+
     def compute_cql_loss(self, state, action):
         with torch.no_grad():
             # Actor
@@ -235,17 +237,19 @@ class Agent(object):
     def select_action(self, state, use_exploration=True, deterministic=True):
         with torch.no_grad():
             state = torch.tensor(state.reshape(1, -1), dtype=torch.float, device=self.device)
-            action, _ = self.actor(state, deterministic=deterministic)
+            # old: action, _ = self.actor(state, deterministic=deterministic)
+            action, log_policy = self.actor(state, deterministic=deterministic)
 
             if use_exploration:
                 noise = torch.randn_like(action) * (0 if "SAC" in self.args.policy else self.args.exploration_noise)
                 action = action + noise
 
-            return action.clamp(-1, 1).cpu().data.numpy().flatten() * self.max_action
+            # old: return action.clamp(-1, 1).cpu().data.numpy().flatten() * self.max_action
+            return action.clamp(-1, 1).cpu().data.numpy().flatten() * self.max_action, log_policy
 
     def train(self):
         self.training_steps += 1
-        state, action, next_state, reward, not_done = self.replay_buffer.sample()
+        state, action, next_state, reward, not_done, mc_score, log_policy_old = self.replay_buffer.sample()
 
         # Update Critic.
         with torch.no_grad():
@@ -311,7 +315,8 @@ class Agent(object):
             critic_loss.backward()
             self.critic_optimizer.step()
 
-        else:
+        # old: else:
+        elif not "REINFORCE":
             # Critic step.
             critic_loss = LAP_huber(td_loss)
 
@@ -321,18 +326,44 @@ class Agent(object):
 
         # Update Actor.
         if self.training_steps % self.hp.policy_freq == 0:
-            actor, log_prob_a_tilda = self.actor(state)
-            Q = self.critic(state, actor)
-            actor_loss = -Q.mean()
+            # old: actor, log_prob_a_tilda = self.actor(state)
+            actor, log_policy = self.actor(state)
+
+            if "REINFORCE" in self.args.policy:
+                if "PPO" in self.args.policy:
+                    # ratio of probabilities
+                    log_policy -= log_policy_old
+
+                    # clip
+                    clipped_log_ratio = torch.clamp(log_policy, torch.log(torch.tensor(1.0 - self.args.eps).to(self.args.device)),
+                                                    torch.log(torch.tensor(1.0 + self.args.eps).to(self.args.device)))
+
+                    gradient = torch.min(log_policy * mc_score, clipped_log_ratio * mc_score).sum()
+
+                else:
+                    gradient = (log_policy * mc_score).sum()
+
+
+                self.actor_optimizer.zero_grad()
+                gradient.backward()
+                self.actor_optimizer.step()
+
+            else:
+
+                Q = self.critic(state, actor)
+                actor_loss = -Q.mean()
 
             # BC
             if self.args.offline == 1 and "BC" in self.args.policy:
                 BC_loss = F.mse_loss(actor, action)
                 actor_loss += self.hp.lmbda * Q.abs().mean().detach() * BC_loss
 
-            self.actor_optimizer.zero_grad()
-            actor_loss.backward()
-            self.actor_optimizer.step()
+            if not "REINFORCE" in self.args.policy:
+                self.actor_optimizer.zero_grad()
+                actor_loss.backward()
+                self.actor_optimizer.step()
+
+
 
         # Update Iteration
         if self.training_steps % self.hp.target_update_rate == 0:

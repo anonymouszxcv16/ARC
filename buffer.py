@@ -33,6 +33,9 @@ class LAP(object):
 		self.reward = np.zeros((max_size, 1))
 		self.not_done = np.zeros((max_size, 1))
 
+		self.mc_score = torch.zeros((max_size, 1)).to(args.device)
+		self.log_policy = torch.zeros((max_size, 1)).to(args.device)
+
 		self.prioritized = prioritized
 
 		if prioritized:
@@ -45,12 +48,14 @@ class LAP(object):
 		self.args = args
 
 	# Add tuple.
-	def add(self, state, action, next_state, reward, done):
+	def add(self, state, action, next_state, reward, done, log_policy):
 		self.state[self.ptr] = state
 		self.action[self.ptr] = action / self.normalize_actions
 		self.next_state[self.ptr] = next_state
 		self.reward[self.ptr] = reward
 		self.not_done[self.ptr] = 1. - done
+
+		self.log_policy[self.ptr] = log_policy
 		
 		if self.prioritized:
 			self.priority[self.ptr] = self.max_priority
@@ -73,7 +78,10 @@ class LAP(object):
 			torch.tensor(self.action[self.ind], dtype=torch.float, device=self.device),
 			torch.tensor(self.next_state[self.ind], dtype=torch.float, device=self.device),
 			torch.tensor(self.reward[self.ind], dtype=torch.float, device=self.device),
-			torch.tensor(self.not_done[self.ind], dtype=torch.float, device=self.device)
+			torch.tensor(self.not_done[self.ind], dtype=torch.float, device=self.device),
+
+			torch.tensor(self.mc_score[self.ind], dtype=torch.float, device=self.device),
+			torch.tensor(self.log_policy[self.ind], dtype=torch.float, device=self.device)
 		)
 
 	def update_priority(self, priority):
