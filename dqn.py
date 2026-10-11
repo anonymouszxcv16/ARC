@@ -265,7 +265,6 @@ class Agent():
 
                         self.std_inverse_sum = 0
 
-        print(q_next.shape, reward.shape)
         q_next = (q_next * self.args.discount) + reward
 
         # Compute Huber loss
