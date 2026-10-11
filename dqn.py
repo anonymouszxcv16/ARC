@@ -27,6 +27,9 @@ class ReplayMemory:
         self.reward = torch.zeros((capacity, 1), dtype=torch.float32, device=args.device)
         self.done = torch.zeros((capacity, 1), dtype=torch.bool, device=args.device)
 
+        self.mc_score = torch.zeros((capacity, 1), dtype=torch.float32, device=args.device)
+        self.mc_score_srs = torch.zeros((capacity, 1), dtype=torch.float32, device=args.device)
+
         self.priority = torch.ones((capacity,), dtype=torch.float32, device=args.device)
 
     # Add tuple.
@@ -153,6 +156,7 @@ class Agent():
         self.optimizer = optim.AdamW(self.policy_net.parameters(), lr=args.lr, amsgrad=True)
 
         self.memory = ReplayMemory(args.replay_size, args)
+        self.unconscious_memory = ReplayMemory(args.replay_size, args)
 
         self.std_inverse_sum = 0
 
@@ -173,6 +177,7 @@ class Agent():
 
         if sample > eps_threshold or greedy:
             with torch.no_grad():
+                # print(state.shape)
                 zs = self.fixed_encoder.zs(state)
                 # t.max(1) will return the largest column value of each row.
                 action = self.policy_net(state, zs)[q_idx].argmax(-1)
@@ -240,7 +245,8 @@ class Agent():
             rewards_mean, rewards_max = self.memory.reward[
                                         :self.memory.size].mean(), self.memory.reward[
                                                                           :self.memory.size].max()
-            reward = reward.expand((self.args.batch_size, self.args.N)).clone()
+            # old: reward = reward.expand((self.args.batch_size, self.args.N)).clone()
+            reward = reward.expand((self.args.batch_size, self.args.N)).clone().T
             reward = ((reward - rewards_mean) / rewards_max)
 
             if "RRS" in self.args.policy:
@@ -259,6 +265,7 @@ class Agent():
 
                         self.std_inverse_sum = 0
 
+        print(q_next.shape, reward.shape)
         q_next = (q_next * self.args.discount) + reward
 
         # Compute Huber loss
