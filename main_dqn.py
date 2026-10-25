@@ -124,7 +124,8 @@ if __name__ == '__main__':
 
     # Evaluation
     parser.add_argument("--max_timesteps", default=int(1e6), type=int)
-    parser.add_argument("--timesteps_before_training", default=1_000, type=int)
+    # old: parser.add_argument("--timesteps_before_training", default=1_000, type=int)
+    parser.add_argument("--timesteps_before_training", default=25_000, type=int)
     parser.add_argument("--eval_iter", default=int(5e3), type=int)
     parser.add_argument("--eval_eps", default=10, type=int)
 
