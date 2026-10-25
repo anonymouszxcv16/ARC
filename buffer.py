@@ -107,7 +107,7 @@ class LAP(object):
 			truncations = getattr(episode, 'truncations', np.zeros_like(episode.rewards))
 
 			# Align observations with actions/rewards
-			T = len(actions_arr)
+			# old: T = len(actions_arr)
 			states.extend(observations[:-1])  # First T observations
 			actions.extend(actions_arr)
 			next_states.extend(observations[1:])  # Next T observations

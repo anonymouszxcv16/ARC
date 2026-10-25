@@ -3,7 +3,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from sympy import prime
+# old: from sympy import prime
 
 import buffer
 
@@ -237,14 +237,12 @@ class Agent(object):
     def select_action(self, state, use_exploration=True, deterministic=True):
         with torch.no_grad():
             state = torch.tensor(state.reshape(1, -1), dtype=torch.float, device=self.device)
-            # old: action, _ = self.actor(state, deterministic=deterministic)
             action, log_policy = self.actor(state, deterministic=deterministic)
 
             if use_exploration:
                 noise = torch.randn_like(action) * (0 if "SAC" in self.args.policy else self.args.exploration_noise)
                 action = action + noise
 
-            # old: return action.clamp(-1, 1).cpu().data.numpy().flatten() * self.max_action
             return action.clamp(-1, 1).cpu().data.numpy().flatten() * self.max_action, log_policy
 
     def train(self):
@@ -333,7 +331,6 @@ class Agent(object):
 
         # Update Actor.
         if self.training_steps % self.hp.policy_freq == 0:
-            # old: actor, log_prob_a_tilda = self.actor(state)
             actor, log_policy = self.actor(state)
 
             if "REINFORCE" in self.args.policy:
@@ -369,8 +366,6 @@ class Agent(object):
                 self.actor_optimizer.zero_grad()
                 actor_loss.backward()
                 self.actor_optimizer.step()
-
-
 
         # Update Iteration
         if self.training_steps % self.hp.target_update_rate == 0:

@@ -177,7 +177,7 @@ class Agent():
 
         if sample > eps_threshold or greedy:
             with torch.no_grad():
-                # print(state.shape)
+
                 zs = self.fixed_encoder.zs(state)
                 # t.max(1) will return the largest column value of each row.
                 action = self.policy_net(state, zs)[q_idx].argmax(-1)
@@ -245,17 +245,8 @@ class Agent():
             rewards_mean, rewards_max = self.memory.reward[
                                         :self.memory.size].mean(), self.memory.reward[
                                                                           :self.memory.size].max()
-            # old: reward = reward.expand((self.args.batch_size, self.args.N)).clone()
             reward = reward.expand((self.args.batch_size, self.args.N)).clone().T
-            # old: reward = ((reward - rewards_mean) / rewards_max)
             reward = ((reward - rewards_mean + self.args.eps) / (rewards_max + self.args.eps))
-
-            psi = ((0 - rewards_mean + self.args.eps) / (rewards_max + self.args.eps))
-            psi = (1 / self.args.alpha) * 1 / (1 + (-self.args.alpha * psi).exp()) * (
-                    1 + (self.args.alpha * psi).exp()).log()
-
-            if "PSI" in self.args.policy:
-                reward += psi
 
             if "RRS" in self.args.policy:
                 reward = (1 / self.args.alpha) * 1 / (1 + (-self.args.alpha * reward).exp()) * (
@@ -272,6 +263,13 @@ class Agent():
                         self.args.alpha = self.scaled_sigmoid(std_inverse_mean)
 
                         self.std_inverse_sum = 0
+
+            if "PSI" in self.args.policy:
+                r_psi = ((0 - rewards_mean + self.args.eps) / (rewards_max + self.args.eps))
+                r_psi = (1 / self.args.alpha) * 1 / (1 + torch.tensor(-self.args.alpha * r_psi).exp()) * (1 +
+                                                                                                          torch.tensor(self.args.alpha * r_psi).exp()).log()
+
+                reward += r_psi
 
         q_next = (q_next * self.args.discount) + reward
 

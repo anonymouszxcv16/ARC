@@ -15,8 +15,9 @@ def train_offline(RL_agent, env, eval_env, args):
     evals = []
     times = []
 
-    mus = []
-    Ms = []
+    biases = []
+    r_avgs = []
+    mc_avgs = []
 
     alphas = []
     stds = []
@@ -26,7 +27,13 @@ def train_offline(RL_agent, env, eval_env, args):
 
     # Train loop.
     for t in range(int(args.max_timesteps + 1)):
-        maybe_evaluate_and_print(RL_agent, eval_env, evals, times, alphas, stds, mus, Ms, t, start_time, args)
+        maybe_evaluate_and_print(RL_agent, eval_env,
+                                 evals, times, alphas, stds,
+
+                                 r_avgs,
+                                 biases,
+                                 mc_avgs,
+                                 t, start_time, args)
 
         # Train.
         RL_agent.train()
@@ -39,7 +46,9 @@ def train_online(RL_agent, env, eval_env, args):
     alphas = []
     stds = []
 
-    mus, Ms = [], []
+    biases = []
+    mc_avgs = []
+    r_avgs = []
 
     # Initialize
     start_time = time.time()
@@ -54,37 +63,44 @@ def train_online(RL_agent, env, eval_env, args):
 
     episode_transitions = []
 
-    trunc = False
+    # old: trunc = False
 
-    state = torch.tensor(state[0]['observation'])
+    if "maze" in args.env.lower():
+        state = torch.tensor(state[0]['observation'])
+    else:
+        state = torch.tensor(state[0])
 
     t0 = 0
 
     # Train loop.
     for t in range(int(args.max_timesteps + 1)):
         RL_agent.t += 1
-        maybe_evaluate_and_print(RL_agent, eval_env, evals, times, alphas, stds, mus, Ms, t, start_time, args)
+        maybe_evaluate_and_print(RL_agent, eval_env,
+                                 evals, times, alphas, stds,
+
+                                 r_avgs,
+                                 biases,
+                                 mc_avgs,
+                                 t, start_time, args)
 
         # Select action.
         if allow_train:
             action, log_policy = RL_agent.select_action(np.array(state), deterministic=False if "SAC" in args.policy else True)
 
         else:
-            # old: action = env.action_space.sample()
 
             low = torch.tensor(env.action_space.low)
             high = torch.tensor(env.action_space.high)
             dist = torch.distributions.Uniform(low, high)
             action = dist.sample()
-            # old: log_prob = dist.log_prob(action).sum()  # sum over action dims
             log_policy = dist.log_prob(action).sum()  # sum over action dims
 
 
         # Do a step.
-        # old: next_state, reward, ep_finished, _ = env.step(action)
         next_state, reward, ep_finished, trunc, _ = eval_env.step(action)
 
-        next_state = torch.tensor(next_state['observation'])
+        if "maze" in args.env.lower():
+            next_state = torch.tensor(next_state['observation'])
 
         if "Noise" in args.policy:
             sign = 1 if random.randint(0, 1) == 1 else -1
@@ -113,7 +129,6 @@ def train_online(RL_agent, env, eval_env, args):
 
             # SASR
             label = 1 if reward > 0 else 0
-            # label = 1 if ep_total_reward > 0 else 0
 
             for s in episode_transitions:
                 if label == 1:
@@ -125,9 +140,12 @@ def train_online(RL_agent, env, eval_env, args):
             ep_total_reward, ep_timesteps = 0, 0
             ep_num += 1
 
-            trunc = False
+            # old: trunc = False
 
-            state = torch.tensor(state[0]['observation'])
+            if "maze" in args.env.lower():
+                state = torch.tensor(state[0]['observation'])
+            else:
+                state = torch.tensor(state[0])
 
             episode_transitions = []
 
@@ -144,6 +162,18 @@ def train_online(RL_agent, env, eval_env, args):
 
                     r_t = torch.tensor(r_t).to(args.device)
 
+                    if "RRS" in args.policy or "NRS" in args.policy:
+                        # Q-targets.
+                        rewards_mean, rewards_max = RL_agent.replay_buffer.reward[
+                                                    :RL_agent.replay_buffer.size].mean(), RL_agent.replay_buffer.reward[
+                                                                                      :RL_agent.replay_buffer.size].max()
+
+                        r_t = ((r_t - rewards_mean + args.eps) / (rewards_max + args.eps))
+
+                        if "RRS" in args.policy:
+                            r_t = (1 / args.alpha) * 1 / (1 + (-args.alpha * r_t).exp()) * (
+                                        1 + (args.alpha * r_t).exp()).log()
+
                     # r_t ** discount
                     scores[step] += r_t * args.discount ** (t - step)
 
@@ -152,29 +182,47 @@ def train_online(RL_agent, env, eval_env, args):
 
 
 # Logs.
-def maybe_evaluate_and_print(RL_agent, eval_env, evals, times, alphas, stds, mus, Ms, t, start_time, args):
+def maybe_evaluate_and_print(RL_agent, eval_env,
+                             evals, times, alphas, stds,
+
+                             r_avgs,
+                             biases,
+                             mc_avgs,
+                             t, start_time, args):
     if t % args.eval_freq == 0:
         # Rewards
         total_reward = np.zeros(args.eval_eps)
+        q_values = np.zeros(args.eval_eps)
 
         for ep in range(args.eval_eps):
             # gymnasium
             state, done = eval_env.reset()[0], False
             step = 0
 
-            state = torch.tensor(state['observation'])
+            if args.offline == 0 and "maze" in args.env.lower():
+                state = torch.tensor(state['observation'])
+
+            action, _ = RL_agent.select_action(state, deterministic=True)
+            action = torch.tensor(action).to(args.device).unsqueeze(0)
+
+            with torch.no_grad():
+                state = torch.tensor(state, dtype=torch.float).to(RL_agent.args.device).unsqueeze(0)
+
+                Q_target = RL_agent.critic_target(state, action).min(1, keepdim=True)[0]
+
+            q_values[ep] = Q_target
 
             # Episode
             while not done:
                 # Action selection.
-                # old: action = RL_agent.select_action(state, use_exploration=False)
+
                 action, _ = RL_agent.select_action(state, use_exploration=False)
 
                 # Step.
                 state, reward, done, trunc, _ = eval_env.step(action)
-                # print(state)
 
-                state = torch.tensor(state['observation'])
+                if args.offline == 0 and "maze" in args.env.lower():
+                    state = torch.tensor(state['observation'])
 
                 # Reward sum.
                 total_reward[ep] += reward
@@ -189,23 +237,28 @@ def maybe_evaluate_and_print(RL_agent, eval_env, evals, times, alphas, stds, mus
         score = minari.get_normalized_score(RL_agent.dataset, total_reward.mean()) if RL_agent.args.offline == 1 else total_reward.mean().item()
         std = RL_agent.rewards_std / args.eval_freq
 
-        mu = RL_agent.replay_buffer.reward.mean().item()
-        M = RL_agent.replay_buffer.reward.max().item()
+        r_avg = RL_agent.replay_buffer.reward.mean().item()
+
+        bias = torch.tensor(q_values - total_reward).abs().mean().item()
+        mc_avg = RL_agent.replay_buffer.mc_score[:RL_agent.replay_buffer.size].mean().item()
 
         print(f"Timesteps: {(t + 1):,.1f}\tMinutes {time_total:.1f}\tRewards: {score:,.1f}\tAlpha: {RL_agent.args.alpha:,.3f}\tRewards Std: {std:,.3f}\t"
-              f"mu: {mu:,.2f}\tM: {M:,.2f}")
+
+              f"Avg[R]: {r_avg:,.2f}\t"
+              f"Bias: {bias:,.2f}\tAvg[MC]: {mc_avg:,.2f}")
 
         evals.append(score)
         times.append(time_total)
         alphas.append(RL_agent.args.alpha)
         stds.append(std)
 
-        mus.append(mu)
-        Ms.append(M)
+        biases.append(bias)
+        mc_avgs.append(mc_avg)
+        r_avgs.append(r_avg)
 
         # file.
         with open(f"./results/{args.env}/{args.file_name}", "w") as file:
-            file.write(f"{evals}\n{times}\n{alphas}\n{stds}\n{mus}\n{M}")
+            file.write(f"{evals}\n{times}\n{alphas}\n{stds}\n{r_avgs}\n{biases}\n{mc_avgs}")
 
 
 if __name__ == "__main__":
@@ -218,15 +271,15 @@ if __name__ == "__main__":
     parser.add_argument("--alpha", default=0.5, type=float)
     parser.add_argument("--auto_alpha", default=0, type=int)
     parser.add_argument("--auto_alpha_interval", default=100_000, type=int)
-    parser.add_argument('--offline', default=0, type=int)
+    parser.add_argument('--offline', default=1, type=int) # old: 0
 
     parser.add_argument("--eps", default=0.2, type=float)
 
     # Exploration.
-    parser.add_argument("--timesteps_before_training", default=0, type=int)
+    parser.add_argument("--timesteps_before_training", default=25_000, type=int) # old: 0
     parser.add_argument("--exploration_noise", default=.1, type=float)
     parser.add_argument("--discount", default=.99, type=float)
-    parser.add_argument("--N", default=2, type=int)
+    parser.add_argument("--N", default=2, type=int) # old: 1, 2
     parser.add_argument("--buffer_size", default=1e6, type=int)
 
     # Environment.
@@ -257,6 +310,8 @@ if __name__ == "__main__":
         env = dataset.recover_environment()
         eval_env = dataset.recover_environment()
 
+        state_dim = env.observation_space.shape[0]
+
         args.use_checkpoints = False
 
     else:
@@ -270,6 +325,11 @@ if __name__ == "__main__":
         env = gym.make(args.env)
         eval_env = gym.make(args.env)
 
+        if "maze" in args.env.lower():
+            state_dim = env.observation_space['observation'].shape[0]
+        else:
+            state_dim = env.observation_space.shape[0]
+
     # Seed.
     env.action_space.seed(args.seed)
 
@@ -277,8 +337,6 @@ if __name__ == "__main__":
     np.random.seed(args.seed)
 
     # Environment
-    # old: state_dim = env.observation_space.shape[0]
-    state_dim = env.observation_space['observation'].shape[0]
     action_dim = env.action_space.shape[0]
     max_action = float(env.action_space.high[0])
 
