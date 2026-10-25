@@ -217,12 +217,12 @@ class Agent():
             zs = self.fixed_encoder.zs(state)
 
         q = self.policy_net(state, zs).squeeze(2).gather(index=action.reshape(1, state.shape[0], 1), dim=-1).flip(0).squeeze(-1)
-        q_next = torch.zeros(self.args.N, state.shape[0], device=self.args.device, dtype=torch.long)
+        q_next = torch.zeros(self.args.N, state.shape[0], device=self.args.device, dtype=torch.float32)
 
         with torch.no_grad():
             zs_target = self.fixed_encoder_target.zs(non_final_next_states)
             q_next[:, non_final_mask] = (self.target_net(non_final_next_states, zs_target).amax(-1).squeeze(-1).clone().detach().to(self.args.device,
-                                                                                                                                    dtype=torch.long))
+                                                                                                                                    dtype=torch.float32))
         # Tanh
         if "TANH" in self.args.policy:
             reward = torch.tanh(reward)
@@ -247,7 +247,15 @@ class Agent():
                                                                           :self.memory.size].max()
             # old: reward = reward.expand((self.args.batch_size, self.args.N)).clone()
             reward = reward.expand((self.args.batch_size, self.args.N)).clone().T
-            reward = ((reward - rewards_mean) / rewards_max)
+            # old: reward = ((reward - rewards_mean) / rewards_max)
+            reward = ((reward - rewards_mean + self.args.eps) / (rewards_max + self.args.eps))
+
+            psi = ((0 - rewards_mean + self.args.eps) / (rewards_max + self.args.eps))
+            psi = (1 / self.args.alpha) * 1 / (1 + (-self.args.alpha * psi).exp()) * (
+                    1 + (self.args.alpha * psi).exp()).log()
+
+            if "PSI" in self.args.policy:
+                reward += psi
 
             if "RRS" in self.args.policy:
                 reward = (1 / self.args.alpha) * 1 / (1 + (-self.args.alpha * reward).exp()) * (

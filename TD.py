@@ -275,7 +275,7 @@ class Agent(object):
                 # Q-targets.
                 rewards_mean, rewards_max = self.replay_buffer.reward[:self.replay_buffer.size].mean(), self.replay_buffer.reward[:self.replay_buffer.size].max()
                 reward = reward.expand((self.replay_buffer.batch_size, self.args.N)).clone()
-                reward = ((reward - rewards_mean) / rewards_max)
+                reward = ((reward - rewards_mean + self.args.eps) / (rewards_max + self.args.eps))
 
                 if "TANH" in self.args.policy:
                     reward = torch.tanh(reward)
@@ -294,6 +294,13 @@ class Agent(object):
                             self.args.alpha = self.scaled_sigmoid(std_inverse_mean)
 
                             self.std_inverse_sum = 0
+
+                if "PSI" in self.args.policy:
+                    r_psi = ((0 - rewards_mean + self.args.eps) / (rewards_max + self.args.eps))
+                    r_psi = (1 / self.args.alpha) * 1 / (1 + torch.tensor(-self.args.alpha * r_psi).exp()) * (1 +
+                                                                                                              torch.tensor(self.args.alpha * r_psi).exp()).log()
+
+                    reward += r_psi
 
             rewards_std = self.replay_buffer.reward.std()
             self.rewards_std += rewards_std
