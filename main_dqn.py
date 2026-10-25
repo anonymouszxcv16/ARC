@@ -9,16 +9,21 @@ import procgen
 from dqn import Agent
 from helpers import PreprocessFrame
 
-def evaluate(args, env, agent, scores, biases, variances, stds, times):
+def evaluate(args, env, agent,
+             scores, biases, variances,
+
+             r_avgs,
+             mc_avgs,
+
+             alphas,
+
+             times):
     discounteds = []
     qs = []
 
     # Mean.
     for idx in range(args.eval_eps):
         state = env.reset()
-
-        if "ALE" in args.env:
-            state = state[0]
 
         state = preprocessor.reset(state)
         state = torch.tensor(state, dtype=torch.float32, device=args.device).unsqueeze(0)
@@ -33,15 +38,13 @@ def evaluate(args, env, agent, scores, biases, variances, stds, times):
 
         ep_finished = False
 
+        # old: done = False
+
         # Episode.
         while not ep_finished:
             action = agent.select_action(state, q_idx=random.randint(0, args.N - 1))
 
-            if "ALE" in args.env:
-                observation, reward, done, trunc, _ = env.step(action.item())
-            else:
-                observation, reward, done, _ = env.step(action.item())
-                trunc = False
+            observation, reward, done, _ = env.step(action.item())
 
             observation = preprocessor.step(observation)
             state = torch.tensor(observation, dtype=torch.float32, device=args.device).unsqueeze(0)
@@ -49,39 +52,43 @@ def evaluate(args, env, agent, scores, biases, variances, stds, times):
             rewards += reward * agent.args.discount ** step
             step += 1
 
-            ep_finished = done or trunc
+            ep_finished = done
 
         discounteds.append(rewards)
 
     # Mean
     rewards_avg = torch.tensor(discounteds).mean()
     variance = torch.tensor(discounteds).std()
-    qs_avg = torch.tensor(qs).mean()
 
-    bias = torch.tensor(rewards_avg - qs_avg).abs().item()
-
-    # Collect metrics,
-    scores.append(rewards_avg)
-    variances.append(variance)
+    bias = (torch.tensor(qs) - torch.tensor(discounteds)).mean()
 
     time_tot = (time.time() - time_start) / 60
     times.append(time_tot)
 
-    epsilon = agent.get_epsilon()
-    std = (agent.memory.reward[:agent.memory.size].std() / agent.memory.reward[:agent.memory.size].mean()).item()
+    # R, MC
+    r_avg = agent.memory.reward[:agent.memory.size].mean().item()
+    mc_avg = agent.memory.mc_score[:agent.memory.size].mean().item()
+
+    scores.append(rewards_avg.item())
+    variances.append(variance.item())
 
     # Rewards std
-    stds.append(std)
-    biases.append(bias)
+    r_avgs.append(r_avg)
+    mc_avgs.append(mc_avg)
+
+    biases.append(bias.item())
+
+    alphas.append(agent.args.alpha)
 
     # Log score.
     with open(f"./results/RRS/{args.env}/{args.file_name}", "w") as file:
-        file.write(f"{scores}\n{times}\n{biases}\n{variances}\n{stds}")
+        file.write(f"{scores}\n{times}\n{biases}\n{variances}\n{r_avgs}\n{mc_avgs}\n{alphas}")
 
     # Log.
-    print(f"Steps: {agent.t:,.1f}\tTimes: {time_tot:,.1f}\tScore: {rewards_avg:,.3f}\t"
-          f"Std(R): {std:,.2f}\t"
-          f"Bias: {bias:,.2f}\tVariance: {variance:,.2f}\tEpsilon: {epsilon:,.2f}")
+    print(f"Steps: {agent.t:,.1f}\tTimes: {time_tot:,.1f}\tScore: {rewards_avg:,.3f}\t"          
+          f"Avg(R): {r_avg:,.2f}\tAvg[MC]: {mc_avg:,.2f}\t"
+          f"Bias: {bias:,.2f}\tVariance: {variance:,.2f}\t"
+          f"Alpha: {agent.args.alpha:,.2f}")
 
 
 if __name__ == '__main__':
@@ -96,10 +103,12 @@ if __name__ == '__main__':
 
     # RRS
     parser.add_argument("--alpha", default=1, type=float)
-    parser.add_argument("--auto_alpha", default=1, type=int)
+    parser.add_argument("--auto_alpha", default=0, type=int)
     parser.add_argument("--auto_alpha_interval", default=1_000, type=int)
     parser.add_argument("--alpha_max", default=1, type=float)
     parser.add_argument("--alpha_min", default=.5, type=float)
+
+    parser.add_argument("--eps", default=0.2, type=float)
 
     # Architecture
     parser.add_argument("--hdim", default=256, type=int)
@@ -115,7 +124,7 @@ if __name__ == '__main__':
 
     # Evaluation
     parser.add_argument("--max_timesteps", default=int(1e6), type=int)
-    parser.add_argument("--timesteps_before_training", default=25_000, type=int)
+    parser.add_argument("--timesteps_before_training", default=1_000, type=int)
     parser.add_argument("--eval_iter", default=int(5e3), type=int)
     parser.add_argument("--eval_eps", default=10, type=int)
 
@@ -146,15 +155,13 @@ if __name__ == '__main__':
         os.makedirs(f"{os.getcwd()}/results/RRS/{args.env}")
 
     env = gym.make(args.env)
+    # old: env_eval = gym.make(args.env, num_levels=0)
     env_eval = gym.make(args.env)
 
-    preprocessor = PreprocessFrame()
+    preprocessor = PreprocessFrame(grayscale=False)
     env.action_space.seed(args.seed)
 
     state = env.reset()
-
-    if "ALE" in args.env:
-        state = state[0]
 
     state = preprocessor.reset(state)
 
@@ -179,15 +186,22 @@ if __name__ == '__main__':
     times = []
     variances = []
     biases = []
-    stds = []
+
+    count_mc_shift_tots = []
+    count_r_shift_tots = []
+
+    r_avgs = []
+    mc_avgs = []
+    mc_srs_avgs = []
+    alphas = []
+
+    ep_total_reward, ep_timesteps = 0, 0
+    agent.t0 = 0
 
     # Train.
     while agent.t < args.max_timesteps:
         # Initialize the environment and get its state
         state = env.reset()
-
-        if "ALE" in args.env:
-            state = state[0]
 
         # Tetris
         state = agent.preprocessor.reset(state)
@@ -199,27 +213,69 @@ if __name__ == '__main__':
         while not ep_finished:
             if agent.t % args.eval_iter == 0:
                 # Evaluate RL.
-                evaluate(args, env_eval, agent, scores, biases, variances, stds, times)
+                evaluate(args, env_eval, agent,
+                         scores, biases, variances,
+
+                         r_avgs,
+                         mc_avgs,
+
+                         alphas,
+
+                         times)
 
             agent.t += 1
 
             action = agent.select_action(state)
-
-            if "ALE" in args.env:
-                observation, reward, done, trunc, _ = env.step(action.item())
-            else:
-                observation, reward, done, _ = env.step(action.item())
-                trunc = False
+            observation, reward, done, _ = env.step(action.item())
 
             # Tetris
             observation = agent.preprocessor.step(observation)
             reward = torch.tensor([reward], dtype=torch.float32, device=args.device)
 
-            ep_finished = done or trunc
+            ep_finished = done
             done = torch.tensor(done)
+
+            ep_total_reward += reward
+            ep_timesteps += 1
 
             if done:
                 next_state = torch.zeros(state.shape, dtype=torch.float32, device=args.device)
+                ep_total_reward, ep_timesteps = 0, 0
+
+                # Episode length
+                T = agent.t - agent.t0
+                mc_scores = torch.zeros((T, 1)).to(args.device)
+                mc_scores_srs = torch.zeros((T, 1)).to(args.device)
+
+                # Gt
+                for step in range(T):
+                    # t
+                    for t in range(step, T):
+                        # r_t
+                        r_t = agent.memory.reward[agent.t - agent.t0 + t]
+                        r_t_srs = agent.memory.reward[agent.t - agent.t0 + t]
+
+                        if "RRS" in args.policy or "NRS" in args.policy:
+                            # Q-targets.
+                            rewards_mean, rewards_max = agent.memory.reward[:agent.memory.size].mean(), agent.memory.reward[:agent.memory.size].max()
+                            r_t_srs = ((r_t_srs - rewards_mean) / (rewards_max if rewards_max > 0 else 1))
+
+                            if "RRS" in args.policy:
+                                r_t_srs = (1 / args.alpha) * 1 / (1 + (-args.alpha * r_t_srs).exp()) * (1 + (args.alpha * r_t_srs).exp()).log()
+
+                        mc_scores[step] += r_t * args.discount ** (t - step)
+                        mc_scores_srs[step] += r_t_srs * args.discount ** (t - step)
+
+                if agent.t0 % args.replay_size > agent.t % args.replay_size:
+                    idxs = list(range(agent.t0 % args.replay_size, args.replay_size)) + list(
+                        range(agent.t % args.replay_size))
+                else:
+                    idxs = range(agent.t0 % args.replay_size, agent.t % args.replay_size)
+
+                agent.memory.mc_score[idxs] = mc_scores
+                agent.memory.mc_score_srs[idxs] = mc_scores_srs
+                agent.t0 = agent.t
+
             else:
                 next_state = torch.tensor(observation, dtype=torch.float32, device=args.device).unsqueeze(0)
 
